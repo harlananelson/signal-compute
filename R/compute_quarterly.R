@@ -45,12 +45,17 @@ if (!dir_exists(ds_path)) {
 ds <- open_dataset(ds_path, format = "parquet",
                    partitioning = c("year", "quarter"))
 
-quarters <- ds |>
+quarters_meta <- ds |>
   select("year", "quarter") |>
   distinct() |>
-  collect() |>
-  mutate(q_label = paste0(.data$year, "Q", gsub("quarter=", "", .data$quarter))) |>
-  arrange(.data$year, .data$quarter) |>
+  collect()
+# Hive partitioning exposes "year" as characters from the path name, not the
+# column value. Normalize defensively.
+quarters_meta$year_n <- gsub("year=", "", quarters_meta$year)
+quarters_meta$q_n    <- gsub("quarter=Q?", "", quarters_meta$quarter)
+quarters <- quarters_meta |>
+  mutate(q_label = paste0(.data$year_n, "Q", .data$q_n)) |>
+  arrange(.data$q_label) |>
   pull("q_label")
 
 cli_inform("Quarters in dataset: {length(quarters)} ({.field {quarters[1]}} .. {.field {quarters[length(quarters)]}})")
@@ -62,10 +67,16 @@ window_data <- function(ds, qtr_labels) {
   qs    <- paste0("quarter=Q", substr(qtr_labels, 6, 6))
   years_filter <- unique(years)
   qs_filter <- unique(qs)
-  ds |>
+  df <- ds |>
     filter(.data$year %in% years_filter, .data$quarter %in% qs_filter) |>
-    collect() |>
-    rename(drug = "drug_name", event = "outcome_name") |>
+    collect()
+  # faers-pipeline emits (rxcui, rxnorm_name, outcome_name, observed) in the
+  # new schema. Map to the (drug, event) shape safetysignal expects. Keep
+  # rxcui + rxnorm_name as metadata to surface downstream.
+  drug_col <- dplyr::coalesce(df$rxnorm_name, df$rxcui)
+  df$drug <- drug_col
+  df$event <- df$outcome_name
+  df |>
     group_by(.data$drug, .data$event) |>
     summarize(observed = sum(.data$observed), .groups = "drop") |>
     filter(.data$observed >= 1)
