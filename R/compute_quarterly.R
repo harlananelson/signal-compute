@@ -42,19 +42,21 @@ if (!dir_exists(ds_path)) {
   cli_abort("No contingency data at {.path {ds_path}}. Run faers-pipeline first.")
 }
 
-ds <- open_dataset(ds_path, format = "parquet",
-                   partitioning = c("year", "quarter"))
+ds <- open_dataset(
+  ds_path,
+  format = "parquet",
+  partitioning = arrow::hive_partition(year = arrow::int32(),
+                                        quarter = arrow::string())
+)
 
 quarters_meta <- ds |>
   select("year", "quarter") |>
   distinct() |>
   collect()
-# Hive partitioning exposes "year" as characters from the path name, not the
-# column value. Normalize defensively.
-quarters_meta$year_n <- gsub("year=", "", quarters_meta$year)
-quarters_meta$q_n    <- gsub("quarter=Q?", "", quarters_meta$quarter)
+# With explicit hive_partition(year=int32, quarter=string), the values are
+# just "2024" and "1"/"2"/"3"/"4" after stripping the "name=" prefix.
 quarters <- quarters_meta |>
-  mutate(q_label = paste0(.data$year_n, "Q", .data$q_n)) |>
+  mutate(q_label = paste0(.data$year, "Q", .data$quarter)) |>
   arrange(.data$q_label) |>
   pull("q_label")
 
@@ -62,14 +64,21 @@ cli_inform("Quarters in dataset: {length(quarters)} ({.field {quarters[1]}} .. {
 
 # ---- Per-quarter compute ----
 window_data <- function(ds, qtr_labels) {
-  # qtr_labels like c("2010Q1", "2010Q2", ...); filter ds to those quarters
-  years <- substr(qtr_labels, 1, 4)
-  qs    <- paste0("quarter=Q", substr(qtr_labels, 6, 6))
-  years_filter <- unique(years)
-  qs_filter <- unique(qs)
+  # qtr_labels like c("2010Q1", "2010Q2", ...); filter ds via the hive
+  # partition keys (year: int, quarter: string "1"/"2"/"3"/"4"). The
+  # in-file `quarter` column (which has "2010Q1" style values) is
+  # shadowed by the partition key with the same name, so we filter
+  # using path-derived partition values.
+  years_filter <- as.integer(substr(qtr_labels, 1, 4))
+  qs_filter    <- substr(qtr_labels, 6, 6)
   df <- ds |>
     filter(.data$year %in% years_filter, .data$quarter %in% qs_filter) |>
     collect()
+  # After collect, re-derive the YYYYQN quarter label from year + quarter
+  # so downstream code has the value it expects.
+  if (nrow(df) > 0) {
+    df$quarter <- paste0(df$year, "Q", df$quarter)
+  }
   # faers-pipeline emits (rxcui, rxnorm_name, outcome_name, observed) in the
   # new schema. Map to the (drug, event) shape safetysignal expects. Keep
   # rxcui + rxnorm_name as metadata to surface downstream.
