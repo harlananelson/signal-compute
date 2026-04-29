@@ -64,20 +64,30 @@ cli_inform("Quarters in dataset: {length(quarters)} ({.field {quarters[1]}} .. {
 
 # ---- Per-quarter compute ----
 window_data <- function(ds, qtr_labels) {
-  # qtr_labels like c("2010Q1", "2010Q2", ...); filter ds via the hive
-  # partition keys (year: int, quarter: string "1"/"2"/"3"/"4"). The
-  # in-file `quarter` column (which has "2010Q1" style values) is
-  # shadowed by the partition key with the same name, so we filter
-  # using path-derived partition values.
-  years_filter <- as.integer(substr(qtr_labels, 1, 4))
-  qs_filter    <- substr(qtr_labels, 6, 6)
+  # qtr_labels like c("2010Q1", "2010Q2", ...). Filter via the hive
+  # partition keys (year: int, quarter: string "1"/"2"/"3"/"4").
+  #
+  # Note: a previous version filtered by
+  #   year %in% years_filter, quarter %in% qs_filter
+  # which is a CROSS-PRODUCT match on the partition keys. For windows
+  # spanning a year boundary (e.g., 2018Q1's window = 2017Q2..2018Q1
+  # has years c(2017, 2018) and quarters c("2","3","4","1")), the
+  # cross-product matches all 8 partitions of 2017+2018, not the
+  # intended 4. That over-fetch silently inflated `oe_window` size by
+  # up to 2× on year-boundary windows; downstream `detect_all_methods`
+  # then returned NULL via tryCatch on those, dropping 26 quarters
+  # from the 2018-2024 range out of the signals parquet.
+  #
+  # Fix: filter partitions by year only (over-reads at most 2× at year
+  # boundaries — fast on Arrow), then post-collect filter on the
+  # constructed YYYYQN label to keep exactly the intended 4 quarters.
+  years_in_window <- unique(as.integer(substr(qtr_labels, 1, 4)))
   df <- ds |>
-    filter(.data$year %in% years_filter, .data$quarter %in% qs_filter) |>
+    filter(.data$year %in% years_in_window) |>
     collect()
-  # After collect, re-derive the YYYYQN quarter label from year + quarter
-  # so downstream code has the value it expects.
   if (nrow(df) > 0) {
     df$quarter <- paste0(df$year, "Q", df$quarter)
+    df <- df[df$quarter %in% qtr_labels, , drop = FALSE]
   }
   # faers-pipeline emits (rxcui, rxnorm_name, outcome_name, observed) in the
   # new schema. Map to the (drug, event) shape safetysignal expects. Keep
@@ -142,7 +152,7 @@ for (i in seq_along(quarters)) {
 
 # ---- Bind and EWMA smooth ----
 long <- dplyr::bind_rows(all_signals)
-cli_inform("Total rows: {nrow(long):,}")
+cli_inform("Total rows: {format(nrow(long), big.mark = ',')}")
 
 cli_h2("EWMA smoothing (lambda = {ewma_lambda})")
 long <- long |>
@@ -162,7 +172,7 @@ today <- format(Sys.Date(), "%Y-%m-%d")
 out_path <- file.path(output_root,
                       paste0("signals_", source_name, "_v", today, ".parquet"))
 arrow::write_parquet(long, out_path, compression = "snappy")
-cli_alert_success("Wrote {nrow(long):,} rows to {.path {out_path}}")
+cli_alert_success("Wrote {format(nrow(long), big.mark = ',')} rows to {.path {out_path}}")
 
 cli_h2("Summary")
 cat(sprintf("  Quarters processed:   %d\n", length(all_signals)))
